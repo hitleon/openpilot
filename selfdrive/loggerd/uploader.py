@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import re
 import time
 import stat
 import json
@@ -9,6 +10,7 @@ import inspect
 import requests
 import traceback
 import threading
+import subprocess
 
 from collections import Counter
 from selfdrive.swaglog import cloudlog
@@ -66,6 +68,27 @@ def clear_locks(root):
     except OSError:
       cloudlog.exception("clear_locks failed")
 
+def is_on_wifi():
+  # ConnectivityManager.getActiveNetworkInfo()
+  try:
+    result = subprocess.check_output(["service", "call", "connectivity", "2"]).strip().split("\n")
+  except subprocess.CalledProcessError:
+    return False
+
+  data = ''.join(''.join(w.decode("hex")[::-1] for w in l[14:49].split()) for l in result[1:])
+
+  return "\x00".join("WIFI") in data
+
+def is_on_hotspot():
+  try:
+    result = subprocess.check_output(["ifconfig", "wlan0"])
+    result = re.findall(r"inet addr:((\d+\.){3}\d+)", result)[0][0]
+
+    is_android = result.startswith('192.168.43.')
+    is_ios = result.startswith('172.20.10.')
+    return (is_android or is_ios)
+  except:
+    return False
 
 class Uploader(object):
   def __init__(self, dongle_id, access_token, root):
@@ -111,32 +134,41 @@ class Uploader(object):
       total_size += os.stat(fn).st_size
     return dict(name_counts), total_size
 
-  def next_file_to_upload(self):
+  def next_file_to_compress(self):
+    for name, key, fn in self.gen_upload_files():
+      if name.endswith("log"):
+        return (key, fn, 0)
+    return None
+
+  def next_file_to_upload(self, with_video):
     # try to upload log files first
     for name, key, fn in self.gen_upload_files():
-      if name in ["rlog", "rlog.bz2"]:
+      if name  == "rlog.bz2":
         return (key, fn, 0)
 
-    # then upload compressed camera file
-    for name, key, fn in self.gen_upload_files():
-      if name in ["fcamera.hevc"]:
-        return (key, fn, 1)
+    if with_video:
+      # then upload compressed rear and front camera files
+      for name, key, fn in self.gen_upload_files():
+        if name == "fcamera.hevc":
+          return (key, fn, 1)
+        elif name == "dcamera.hevc":
+          return (key, fn, 2)
 
-    # then upload other files
-    for name, key, fn in self.gen_upload_files():
-      if not name.endswith('.lock') and not name.endswith(".tmp"):
-        return (key, fn, 1)
+      # then upload other files
+      for name, key, fn in self.gen_upload_files():
+        if not name.endswith('.lock') and not name.endswith(".tmp"):
+          return (key, fn, 3)
 
     return None
 
 
   def do_upload(self, key, fn):
     try:
-      url_resp = api_get("v1.1/"+self.dongle_id+"/upload_url/", timeout=2, path=key, access_token=self.access_token)
+      url_resp = api_get("v1.2/"+self.dongle_id+"/upload_url/", timeout=2, path=key, access_token=self.access_token)
       url_resp_json = json.loads(url_resp.text)
       url = url_resp_json['url']
       headers = url_resp_json['headers']
-      cloudlog.info("upload_url v1.1 %s %s", url, str(headers))
+      cloudlog.info("upload_url v1.2 %s %s", url, str(headers))
 
       if fake_upload:
         cloudlog.info("*** WARNING, THIS IS A FAKE UPLOAD TO %s ***" % url)
@@ -146,7 +178,7 @@ class Uploader(object):
         self.last_resp = FakeResponse()
       else:
         with open(fn, "rb") as f:
-          self.last_resp = requests.put(url, data=f, headers=headers)
+          self.last_resp = requests.put(url, data=f, headers=headers, timeout=10)
     except Exception as e:
       self.last_exc = (e, traceback.format_exc())
       raise
@@ -182,7 +214,7 @@ class Uploader(object):
     raise_on_thread(thread, SystemExit)
     thread.join()
 
-  def upload(self, key, fn):
+  def compress(self, key, fn):
     # write out the bz2 compress
     if fn.endswith("log"):
       ext = ".bz2"
@@ -195,6 +227,9 @@ class Uploader(object):
       key += ext
       fn += ext
 
+    return (key, fn)
+
+  def upload(self, key, fn):
     try:
       sz = os.path.getsize(fn)
     except OSError:
@@ -239,34 +274,46 @@ def uploader_fn(exit_event):
 
   uploader = Uploader(dongle_id, access_token, ROOT)
 
+  backoff = 0.1
   while True:
-    backoff = 0.1
-    while True:
+    allow_cellular = (params.get("IsUploadVideoOverCellularEnabled") != "0")
+    on_hotspot = is_on_hotspot()
+    on_wifi = is_on_wifi()
+    should_upload = allow_cellular or (on_wifi and not on_hotspot)
 
-      if exit_event.is_set():
-        return
+    if exit_event.is_set():
+      return
 
-      d = uploader.next_file_to_upload()
-      if d is None:
-        break
-
+    d = uploader.next_file_to_compress()
+    if d is not None:
       key, fn, _ = d
+      uploader.compress(key, fn)
+      continue
 
-      cloudlog.info("to upload %r", d)
-      success = uploader.upload(key, fn)
-      if success:
-        backoff = 0.1
-      else:
-        cloudlog.info("backoff %r", backoff)
-        time.sleep(backoff + random.uniform(0, backoff))
-        backoff = min(backoff*2, 120)
-      cloudlog.info("upload done, success=%r", success)
+    if not should_upload:
+      time.sleep(5)
+      continue
 
-    time.sleep(5)
+    d = uploader.next_file_to_upload(with_video=True)
+    if d is None:
+      time.sleep(5)
+      continue
+
+    key, fn, _ = d
+
+    cloudlog.event("uploader_netcheck", allow_cellular=allow_cellular, is_on_hotspot=on_hotspot, is_on_wifi=on_wifi)
+    cloudlog.info("to upload %r", d)
+    success = uploader.upload(key, fn)
+    if success:
+      backoff = 0.1
+    else:
+      cloudlog.info("backoff %r", backoff)
+      time.sleep(backoff + random.uniform(0, backoff))
+      backoff = min(backoff*2, 120)
+    cloudlog.info("upload done, success=%r", success)
 
 def main(gctx=None):
   uploader_fn(threading.Event())
 
 if __name__ == "__main__":
   main()
-

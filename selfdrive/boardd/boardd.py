@@ -1,4 +1,11 @@
 #!/usr/bin/env python
+
+# This file is not used by OpenPilot. Only boardd.cc is used.
+# The python version is slower, but has more options for development.
+
+# TODO: merge the extra functionalities of this file (like MOCK) in boardd.c and
+# delete this python version of boardd
+
 import os
 import struct
 import zmq
@@ -12,14 +19,15 @@ from selfdrive.swaglog import cloudlog
 # USB is optional
 try:
   import usb1
-  from usb1 import USBErrorIO, USBErrorOverflow
+  from usb1 import USBErrorIO, USBErrorOverflow  #pylint: disable=no-name-in-module
 except Exception:
   pass
 
-# TODO: rewrite in C to save CPU
-
 SAFETY_NOOUTPUT = 0
 SAFETY_HONDA = 1
+SAFETY_TOYOTA = 2
+SAFETY_CHRYSLER = 9
+SAFETY_TOYOTA_NOLIMITS = 0x1336
 SAFETY_ALLOUTPUT = 0x1337
 
 # *** serialization functions ***
@@ -33,7 +41,7 @@ def can_list_to_can_capnp(can_msgs, msgtype='can'):
       cc = dat.can[i]
     cc.address = can_msg[0]
     cc.busTime = can_msg[1]
-    cc.dat = can_msg[2]
+    cc.dat = str(can_msg[2])
     cc.src = can_msg[3]
   return dat
 
@@ -67,9 +75,10 @@ def __parse_can_buffer(dat):
 def can_send_many(arr):
   snds = []
   for addr, _, dat, alt in arr:
-    snd = struct.pack("II", ((addr << 21) | 1), len(dat) | (alt << 4)) + dat
-    snd = snd.ljust(0x10, '\x00')
-    snds.append(snd)
+    if addr < 0x800:  # only support 11 bit addr
+      snd = struct.pack("II", ((addr << 21) | 1), len(dat) | (alt << 4)) + dat
+      snd = snd.ljust(0x10, '\x00')
+      snds.append(snd)
   while 1:
     try:
       handle.bulkWrite(3, ''.join(snds))
@@ -99,20 +108,22 @@ def can_init():
     if device.getVendorID() == 0xbbaa and device.getProductID() == 0xddcc:
       handle = device.open()
       handle.claimInterface(0)
-      handle.controlWrite(0x40, 0xdc, SAFETY_HONDA, 0, b'')
+      handle.controlWrite(0x40, 0xdc, SAFETY_ALLOUTPUT, 0, b'')
 
   if handle is None:
-    print "CAN NOT FOUND"
+    cloudlog.warn("CAN NOT FOUND")
     exit(-1)
 
-  print "got handle"
+  cloudlog.info("got handle")
   cloudlog.info("can init done")
 
 def boardd_mock_loop():
   context = zmq.Context()
   can_init()
+  handle.controlWrite(0x40, 0xdc, SAFETY_ALLOUTPUT, 0, b'')
 
   logcan = messaging.sub_sock(context, service_list['can'].port)
+  sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
 
   while 1:
     tsc = messaging.drain_sock(logcan, wait_for_one=True)
@@ -125,9 +136,9 @@ def boardd_mock_loop():
 
     # recv @ 100hz
     can_msgs = can_recv()
-    print "sent %d got %d" % (len(snd), len(can_msgs))
-
-    #print can_msgs
+    print("sent %d got %d" % (len(snd), len(can_msgs)))
+    m = can_list_to_can_capnp(can_msgs)
+    sendcan.send(m.to_bytes())
 
 def boardd_test_loop():
   can_init()
@@ -138,7 +149,7 @@ def boardd_test_loop():
     #can_send_many([[0xaa,0,"\xaa\xaa\xaa\xaa",1]])
     # recv @ 100hz
     can_msgs = can_recv()
-    print "got %d" % (len(can_msgs))
+    print("got %d" % (len(can_msgs)))
     time.sleep(0.01)
     cnt += 1
 
@@ -156,6 +167,9 @@ def boardd_loop(rate=200):
   # *** subscribes to can send
   sendcan = messaging.sub_sock(context, service_list['sendcan'].port)
 
+  # drain sendcan to delete any stale messages from previous runs
+  messaging.drain_sock(sendcan)
+
   while 1:
     # health packet @ 1hz
     if (rk.frame%rate) == 0:
@@ -167,6 +181,7 @@ def boardd_loop(rate=200):
       msg.health.voltage = health['voltage']
       msg.health.current = health['current']
       msg.health.started = health['started']
+      msg.health.controlsAllowed = True
 
       health_sock.send(msg.to_bytes())
 
@@ -186,9 +201,48 @@ def boardd_loop(rate=200):
 
     rk.keep_time()
 
+# *** main loop ***
+def boardd_proxy_loop(rate=200, address="192.168.2.251"):
+  rk = Ratekeeper(rate)
+  context = zmq.Context()
+
+  can_init()
+
+  # *** subscribes can
+  logcan = messaging.sub_sock(context, service_list['can'].port, addr=address)
+  # *** publishes to can send
+  sendcan = messaging.pub_sock(context, service_list['sendcan'].port)
+
+  # drain sendcan to delete any stale messages from previous runs
+  messaging.drain_sock(sendcan)
+
+  while 1:
+    # recv @ 100hz
+    can_msgs = can_recv()
+    #for m in can_msgs:
+    #  print "R:",hex(m[0]), str(m[2]).encode("hex")
+
+    # publish to logger
+    # TODO: refactor for speed
+    if len(can_msgs) > 0:
+      dat = can_list_to_can_capnp(can_msgs, "sendcan")
+      sendcan.send(dat.to_bytes())
+
+    # send can if we have a packet
+    tsc = messaging.recv_sock(logcan)
+    if tsc is not None:
+      cl = can_capnp_to_can_list(tsc.can)
+      #for m in cl:
+      #  print "S:",hex(m[0]), str(m[2]).encode("hex")
+      can_send_many(cl)
+
+    rk.keep_time()
+
 def main(gctx=None):
   if os.getenv("MOCK") is not None:
     boardd_mock_loop()
+  elif os.getenv("PROXY") is not None:
+    boardd_proxy_loop()
   elif os.getenv("BOARDTEST") is not None:
     boardd_test_loop()
   else:

@@ -37,7 +37,7 @@ def mkdirs_exists_ok(path):
       raise
 
 class TxType(Enum):
-  PERSISTANT = 1
+  PERSISTENT = 1
   CLEAR_ON_MANAGER_START = 2
   CLEAR_ON_CAR_START = 3
 
@@ -46,25 +46,48 @@ class UnknownKeyName(Exception):
 
 keys = {
 # written: manager
-# read:    loggerd, uploaderd, baseui
-  "DongleId": TxType.PERSISTANT,
-  "AccessToken": TxType.PERSISTANT,
-  "Version": TxType.PERSISTANT,
-  "GitCommit": TxType.PERSISTANT,
-  "GitBranch": TxType.PERSISTANT,
+# read:    loggerd, uploaderd, offroad
+  "DongleId": TxType.PERSISTENT,
+  "AccessToken": TxType.PERSISTENT,
+  "Version": TxType.PERSISTENT,
+  "TrainingVersion": TxType.PERSISTENT,
+  "GitCommit": TxType.PERSISTENT,
+  "GitBranch": TxType.PERSISTENT,
+  "GitRemote": TxType.PERSISTENT,
 # written: baseui
 # read:    ui, controls
-  "IsMetric": TxType.PERSISTANT,
-  "IsRearViewMirror": TxType.PERSISTANT,
+  "IsMetric": TxType.PERSISTENT,
+  "IsFcwEnabled": TxType.PERSISTENT,
+  "HasAcceptedTerms": TxType.PERSISTENT,
+  "CompletedTrainingVersion": TxType.PERSISTENT,
+  "IsUploadVideoOverCellularEnabled": TxType.PERSISTENT,
+  "IsDriverMonitoringEnabled": TxType.PERSISTENT,
+  "IsGeofenceEnabled": TxType.PERSISTENT,
+  "SpeedLimitOffset": TxType.PERSISTENT,
 # written: visiond
-# read:    visiond
-  "CalibrationParams": TxType.PERSISTANT,
-# written: visiond
-# read:    visiond, ui
-  "CloudCalibration": TxType.PERSISTANT,
+# read:    visiond, controlsd
+  "CalibrationParams": TxType.PERSISTENT,
+  "ControlsParams": TxType.PERSISTENT,
 # written: controlsd
 # read:    radard
-  "CarParams": TxType.CLEAR_ON_CAR_START}
+  "CarParams": TxType.CLEAR_ON_CAR_START,
+
+  "Passive": TxType.PERSISTENT,
+  "DoUninstall": TxType.CLEAR_ON_MANAGER_START,
+  "ShouldDoUpdate": TxType.CLEAR_ON_MANAGER_START,
+  "IsUpdateAvailable": TxType.PERSISTENT,
+  "LongitudinalControl": TxType.PERSISTENT,
+  "LimitSetSpeed": TxType.PERSISTENT,
+
+  "RecordFront": TxType.PERSISTENT,
+}
+
+def fsync_dir(path):
+  fd = os.open(path, os.O_RDONLY)
+  try:
+    os.fsync(fd)
+  finally:
+    os.close(fd)
 
 
 class FileLock(object):
@@ -182,20 +205,37 @@ class DBWriter(DBAccessor):
     self._check_entered()
 
     try:
+      # data_path refers to the externally used path to the params. It is a symlink.
+      # old_data_path is the path currently pointed to by data_path.
+      # tempdir_path is a path where the new params will go, which the new data path will point to.
+      # new_data_path is a temporary symlink that will atomically overwrite data_path.
+      #
+      # The current situation is:
+      #   data_path -> old_data_path
+      # We're going to write params data to tempdir_path
+      #   tempdir_path -> params data
+      # Then point new_data_path to tempdir_path
+      #   new_data_path -> tempdir_path
+      # Then atomically overwrite data_path with new_data_path
+      #   data_path -> tempdir_path
       old_data_path = None
       new_data_path = None
       tempdir_path = tempfile.mkdtemp(prefix=".tmp", dir=self._path)
+
       try:
         # Write back all keys.
         os.chmod(tempdir_path, 0o777)
         for k, v in self._vals.items():
           with open(os.path.join(tempdir_path, k), "wb") as f:
             f.write(v)
+            f.flush()
+            os.fsync(f.fileno())
+        fsync_dir(tempdir_path)
 
         data_path = self._data_path()
         try:
           old_data_path = os.path.join(self._path, os.readlink(data_path))
-        except (OSError, IOError) as e:
+        except (OSError, IOError):
           # NOTE(mgraczyk): If other DB implementations have bugs, this could cause
           #                 copies to be left behind, but we still want to overwrite.
           pass
@@ -203,16 +243,21 @@ class DBWriter(DBAccessor):
         new_data_path = "{}.link".format(tempdir_path)
         os.symlink(os.path.basename(tempdir_path), new_data_path)
         os.rename(new_data_path, data_path)
-      # TODO(mgraczyk): raise useful error when values are bad.
-      except:
-        shutil.rmtree(tempdir_path)
-        if new_data_path is not None:
-          os.remove(new_data_path)
-        raise
+        fsync_dir(self._path)
+      finally:
+        # If the rename worked, we can delete the old data. Otherwise delete the new one.
+        success = new_data_path is not None and os.path.exists(data_path) and (
+          os.readlink(data_path) == os.path.basename(tempdir_path))
 
-      # Keep holding the lock while we clean up the old data.
-      if old_data_path is not None:
-        shutil.rmtree(old_data_path)
+        if success:
+          if old_data_path is not None:
+            shutil.rmtree(old_data_path)
+        else:
+          shutil.rmtree(tempdir_path)
+
+        # Regardless of what happened above, there should be no link at new_data_path.
+        if new_data_path is not None and os.path.islink(new_data_path):
+          os.remove(new_data_path)
     finally:
       os.umask(self._prev_umask)
       self._prev_umask = None
@@ -222,23 +267,50 @@ class DBWriter(DBAccessor):
       self._lock = None
 
 
+def read_db(params_path, key):
+  path = "%s/d/%s" % (params_path, key)
+  try:
+    with open(path, "rb") as f:
+      return f.read()
+  except IOError:
+    return None
 
-class JSDB(object):
-  def __init__(self, fn):
-    self._fn = fn
+def write_db(params_path, key, value):
+  prev_umask = os.umask(0)
+  lock = FileLock(params_path+"/.lock", True)
+  lock.acquire()
 
-  def begin(self, write=False):
-    if write:
-      return DBWriter(self._fn)
-    else:
-      return DBReader(self._fn)
+  try:
+    tmp_path = tempfile.mktemp(prefix=".tmp", dir=params_path)
+    with open(tmp_path, "wb") as f:
+      f.write(value)
+      f.flush()
+      os.fsync(f.fileno())
+
+    path = "%s/d/%s" % (params_path, key)
+    os.rename(tmp_path, path)
+    fsync_dir(os.path.dirname(path))
+  finally:
+    os.umask(prev_umask)
+    lock.release()
 
 class Params(object):
   def __init__(self, db='/data/params'):
-    self.env = JSDB(db)
+    self.db = db
+
+    # create the database if it doesn't exist...
+    if not os.path.exists(self.db+"/d"):
+      with self.transaction(write=True):
+        pass
+
+  def transaction(self, write=False):
+    if write:
+      return DBWriter(self.db)
+    else:
+      return DBReader(self.db)
 
   def _clear_keys_with_type(self, tx_type):
-    with self.env.begin(write=True) as txn:
+    with self.transaction(write=True) as txn:
       for key in keys:
         if keys[key] == tx_type:
           txn.delete(key)
@@ -249,13 +321,16 @@ class Params(object):
   def car_start(self):
     self._clear_keys_with_type(TxType.CLEAR_ON_CAR_START)
 
+  def delete(self, key):
+    with self.transaction(write=True) as txn:
+      txn.delete(key)
+
   def get(self, key, block=False):
     if key not in keys:
       raise UnknownKeyName(key)
 
     while 1:
-      with self.env.begin() as txn:
-        ret = txn.get(key)
+      ret = read_db(self.db, key)
       if not block or ret is not None:
         break
       # is polling really the best we can do?
@@ -266,9 +341,7 @@ class Params(object):
     if key not in keys:
       raise UnknownKeyName(key)
 
-    with self.env.begin(write=True) as txn:
-      txn.put(key, dat)
-    print "set", key
+    write_db(self.db, key, dat)
 
 if __name__ == "__main__":
   params = Params()
@@ -278,11 +351,11 @@ if __name__ == "__main__":
     for k in keys:
       pp = params.get(k)
       if pp is None:
-        print k, "is None"
+        print("%s is None" % k)
       elif all(ord(c) < 128 and ord(c) >= 32 for c in pp):
-        print k, pp
+        print("%s = %s" % (k, pp))
       else:
-        print k, pp.encode("hex")
+        print("%s = %s" % (k, pp.encode("hex")))
 
   # Test multiprocess:
   # seq 0 100000 | xargs -P20 -I{} python common/params.py DongleId {} && sleep 0.05

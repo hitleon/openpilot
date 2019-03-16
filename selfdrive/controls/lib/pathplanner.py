@@ -1,89 +1,122 @@
+import zmq
 import math
 import numpy as np
 
-from common.numpy_fast import interp
+from common.realtime import sec_since_boot
+from selfdrive.services import service_list
+from selfdrive.swaglog import cloudlog
+from selfdrive.controls.lib.lateral_mpc import libmpc_py
+from selfdrive.controls.lib.drive_helpers import MPC_COST_LAT
+from selfdrive.controls.lib.model_parser import ModelParser
 import selfdrive.messaging as messaging
 
 
-def compute_path_pinv():
-  deg = 3
-  x = np.arange(50.0)
-  X = np.vstack(tuple(x**n for n in range(deg, -1, -1))).T
-  pinv = np.linalg.pinv(X)
-  return pinv
+def calc_states_after_delay(states, v_ego, steer_angle, curvature_factor, steer_ratio, delay):
+  states[0].x = v_ego * delay
+  states[0].psi = v_ego * curvature_factor * math.radians(steer_angle) / steer_ratio * delay
+  return states
 
-def model_polyfit(points, path_pinv):
-  return np.dot(path_pinv, map(float, points))
-
-# lane width http://safety.fhwa.dot.gov/geometric/pubs/mitigationstrategies/chapter3/3_lanewidth.cfm
-_LANE_WIDTH_V = [3., 3.8]
-
-# break points of speed
-_LANE_WIDTH_BP = [0., 31.]
-
-def calc_desired_path(l_poly, r_poly, p_poly, l_prob, r_prob, p_prob, speed):
-  #*** this function computes the poly for the center of the lane, averaging left and right polys
-  lane_width = interp(speed, _LANE_WIDTH_BP, _LANE_WIDTH_V)
-
-  # lanes in US are ~3.6m wide
-  half_lane_poly = np.array([0., 0., 0., lane_width / 2.])
-  if l_prob + r_prob > 0.01:
-    c_poly = ((l_poly - half_lane_poly) * l_prob +
-              (r_poly + half_lane_poly) * r_prob) / (l_prob + r_prob)
-    c_prob = math.sqrt((l_prob**2 + r_prob**2) / 2.)
-  else:
-    c_poly = np.zeros(4)
-    c_prob = 0.
-
-  p_weight = 1. # predicted path weight relatively to the center of the lane
-  d_poly =  list((c_poly*c_prob + p_poly*p_prob*p_weight ) / (c_prob + p_prob*p_weight))
-  return d_poly, c_poly, c_prob
-
-class OptPathPlanner(object):
-  def __init__(self, model):
-    self.model = model
-    self.dead = True
-    self.d_poly = [0., 0., 0., 0.]
-    self.last_model = 0.
-    self._path_pinv = compute_path_pinv()
-
-  def update(self, cur_time, v_ego, md):
-    if md is not None:
-      # simple compute of the center of the lane
-      pts = [(x+y)/2 for x,y in zip(md.model.leftLane.points, md.model.rightLane.points)]
-      self.d_poly = model_polyfit(pts, self._path_pinv)
-
-      self.last_model = cur_time
-      self.dead = False
-    elif cur_time - self.last_model > 0.5:
-      self.dead = True
 
 class PathPlanner(object):
-  def __init__(self):
-    self.dead = True
-    self.d_poly = [0., 0., 0., 0.]
-    self.last_model = 0.
-    self.lead_dist, self.lead_prob, self.lead_var = 0, 0, 1
-    self._path_pinv = compute_path_pinv()
+  def __init__(self, CP):
+    self.MP = ModelParser()
 
-  def update(self, cur_time, v_ego, md):
-    if md is not None:
-      p_poly = model_polyfit(md.model.path.points, self._path_pinv)       # predicted path
-      l_poly = model_polyfit(md.model.leftLane.points, self._path_pinv)   # left line
-      r_poly = model_polyfit(md.model.rightLane.points, self._path_pinv)  # right line
+    self.last_cloudlog_t = 0
 
-      p_prob = 1.                       # model does not tell this probability yet, so set to 1 for now
-      l_prob = md.model.leftLane.prob   # left line prob
-      r_prob = md.model.rightLane.prob  # right line prob
+    context = zmq.Context()
+    self.plan = messaging.pub_sock(context, service_list['pathPlan'].port)
+    self.livempc = messaging.pub_sock(context, service_list['liveMpc'].port)
 
-      self.lead_dist = md.model.lead.dist
-      self.lead_prob = md.model.lead.prob
-      self.lead_var = md.model.lead.std**2
+    self.setup_mpc(CP.steerRateCost)
+    self.invalid_counter = 0
 
-      # compute target path
-      self.d_poly, _, _ = calc_desired_path(l_poly, r_poly, p_poly, l_prob, r_prob, p_prob, v_ego)
+  def setup_mpc(self, steer_rate_cost):
+    self.libmpc = libmpc_py.libmpc
+    self.libmpc.init(MPC_COST_LAT.PATH, MPC_COST_LAT.LANE, MPC_COST_LAT.HEADING, steer_rate_cost)
 
-      self.last_model = cur_time
-      self.dead = False
-    elif cur_time - self.last_model > 0.5:
-      self.dead = True
+    self.mpc_solution = libmpc_py.ffi.new("log_t *")
+    self.cur_state = libmpc_py.ffi.new("state_t *")
+    self.cur_state[0].x = 0.0
+    self.cur_state[0].y = 0.0
+    self.cur_state[0].psi = 0.0
+    self.cur_state[0].delta = 0.0
+
+    self.angle_steers_des = 0.0
+    self.angle_steers_des_mpc = 0.0
+    self.angle_steers_des_prev = 0.0
+    self.angle_steers_des_time = 0.0
+
+  def update(self, CP, VM, CS, md, live100):
+    v_ego = CS.carState.vEgo
+    angle_steers = CS.carState.steeringAngle
+    active = live100.live100.active
+    angle_offset = live100.live100.angleOffset
+    self.MP.update(v_ego, md)
+
+    # Run MPC
+    self.angle_steers_des_prev = self.angle_steers_des_mpc
+    curvature_factor = VM.curvature_factor(v_ego)
+
+    l_poly = libmpc_py.ffi.new("double[4]", list(self.MP.l_poly))
+    r_poly = libmpc_py.ffi.new("double[4]", list(self.MP.r_poly))
+    p_poly = libmpc_py.ffi.new("double[4]", list(self.MP.p_poly))
+
+    # account for actuation delay
+    self.cur_state = calc_states_after_delay(self.cur_state, v_ego, angle_steers, curvature_factor, CP.steerRatio, CP.steerActuatorDelay)
+
+    v_ego_mpc = max(v_ego, 5.0)  # avoid mpc roughness due to low speed
+    self.libmpc.run_mpc(self.cur_state, self.mpc_solution,
+                        l_poly, r_poly, p_poly,
+                        self.MP.l_prob, self.MP.r_prob, self.MP.p_prob, curvature_factor, v_ego_mpc, self.MP.lane_width)
+
+    # reset to current steer angle if not active or overriding
+    if active:
+      delta_desired = self.mpc_solution[0].delta[1]
+    else:
+      delta_desired = math.radians(angle_steers - angle_offset) / CP.steerRatio
+
+    self.cur_state[0].delta = delta_desired
+
+    self.angle_steers_des_mpc = float(math.degrees(delta_desired * CP.steerRatio) + angle_offset)
+
+    #  Check for infeasable MPC solution
+    mpc_nans = np.any(np.isnan(list(self.mpc_solution[0].delta)))
+    t = sec_since_boot()
+    if mpc_nans:
+      self.libmpc.init(MPC_COST_LAT.PATH, MPC_COST_LAT.LANE, MPC_COST_LAT.HEADING, CP.steerRateCost)
+      self.cur_state[0].delta = math.radians(angle_steers) / CP.steerRatio
+
+      if t > self.last_cloudlog_t + 5.0:
+        self.last_cloudlog_t = t
+        cloudlog.warning("Lateral mpc - nan: True")
+
+    if self.mpc_solution[0].cost > 20000. or mpc_nans:   # TODO: find a better way to detect when MPC did not converge
+      self.invalid_counter += 1
+    else:
+      self.invalid_counter = 0
+
+    plan_valid = self.invalid_counter < 2
+
+    plan_send = messaging.new_message()
+    plan_send.init('pathPlan')
+    plan_send.pathPlan.laneWidth = float(self.MP.lane_width)
+    plan_send.pathPlan.dPoly = map(float, self.MP.d_poly)
+    plan_send.pathPlan.cPoly = map(float, self.MP.c_poly)
+    plan_send.pathPlan.cProb = float(self.MP.c_prob)
+    plan_send.pathPlan.lPoly = map(float, l_poly)
+    plan_send.pathPlan.lProb = float(self.MP.l_prob)
+    plan_send.pathPlan.rPoly = map(float, r_poly)
+    plan_send.pathPlan.rProb = float(self.MP.r_prob)
+    plan_send.pathPlan.angleSteers = float(self.angle_steers_des_mpc)
+    plan_send.pathPlan.valid = bool(plan_valid)
+
+    self.plan.send(plan_send.to_bytes())
+
+    dat = messaging.new_message()
+    dat.init('liveMpc')
+    dat.liveMpc.x = list(self.mpc_solution[0].x)
+    dat.liveMpc.y = list(self.mpc_solution[0].y)
+    dat.liveMpc.psi = list(self.mpc_solution[0].psi)
+    dat.liveMpc.delta = list(self.mpc_solution[0].delta)
+    dat.liveMpc.cost = self.mpc_solution[0].cost
+    self.livempc.send(dat.to_bytes())
